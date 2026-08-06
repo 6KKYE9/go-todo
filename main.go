@@ -22,7 +22,21 @@ type Task struct {
 	Priority  int      `json:"priority"`  // 1=低 2=中 3=高
 	Status    string   `json:"status"`    // todo / in_progress / done
 	DueDate   string   `json:"due_date"`  // 截止日期，空表示无
+	Note      string   `json:"note"`      // 备注，空表示无
 	CreatedAt string   `json:"created_at"`
+}
+
+// todayStr 返回本地日期（用于逾期判断）。
+func todayStr() string {
+	return time.Now().Format("2006-01-02")
+}
+
+// isOverdue 判断任务是否已逾期：有截止日、未完成、且截止日早于今天。
+func (t Task) isOverdue() bool {
+	if t.DueDate == "" || t.Status == "done" {
+		return false
+	}
+	return t.DueDate < todayStr()
 }
 
 // dataFile 默认数据文件。测试时会被替换成临时文件。
@@ -136,6 +150,7 @@ func cmdAdd(args []string) (string, error) {
 	tags := []string{}
 	pri := 2
 	due := ""
+	note := ""
 	rest := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -154,12 +169,17 @@ func cmdAdd(args []string) (string, error) {
 				due = strings.TrimSpace(args[i+1])
 				i++
 			}
+		case "-note":
+			if i+1 < len(args) {
+				note = strings.TrimSpace(args[i+1])
+				i++
+			}
 		default:
 			rest = append(rest, args[i])
 		}
 	}
 	if len(rest) == 0 {
-		return "", fmt.Errorf("用法: go-todo add <标题> [-tag a,b] [-pri high|mid|low] [-due 2026-08-10]")
+		return "", fmt.Errorf("用法: go-todo add <标题> [-tag a,b] [-pri high|mid|low] [-due 2026-08-10] [-note 备注]")
 	}
 	title := strings.Join(rest, " ")
 	tasks := load()
@@ -170,6 +190,7 @@ func cmdAdd(args []string) (string, error) {
 		Priority:  pri,
 		Status:    "todo",
 		DueDate:   due,
+		Note:      note,
 		CreatedAt: time.Now().Format("2006-01-02 15:04"),
 	}
 	tasks = append(tasks, t)
@@ -189,6 +210,39 @@ func listTasks() []Task {
 	return tasks
 }
 
+// listOptions 是 list 的过滤选项。
+type listOptions struct {
+	tag    string // 只显示含该标签的任务（空=不过滤）
+	status string // 只显示该状态的任务（空=不过滤）
+}
+
+// filterTasks 按选项过滤任务；tag/status 为空表示不过滤。
+func filterTasks(tasks []Task, opt listOptions) []Task {
+	if opt.tag == "" && opt.status == "" {
+		return tasks
+	}
+	var out []Task
+	for _, t := range tasks {
+		if opt.tag != "" {
+			hit := false
+			for _, tg := range t.Tags {
+				if strings.EqualFold(tg, opt.tag) {
+					hit = true
+					break
+				}
+			}
+			if !hit {
+				continue
+			}
+		}
+		if opt.status != "" && t.Status != opt.status {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
 func statusText(s string) string {
 	switch s {
 	case "in_progress":
@@ -200,11 +254,11 @@ func statusText(s string) string {
 	}
 }
 
-// cmdList 列出全部任务，返回渲染后的多行文本（无任务时含提示）。
-func cmdList() string {
-	tasks := listTasks()
+// cmdList 列出全部任务（按优先级排序，可经 opt 过滤），返回渲染后的多行文本。
+func cmdList(opt listOptions) string {
+	tasks := filterTasks(listTasks(), opt)
 	if len(tasks) == 0 {
-		return "还没有任何任务，先用 add 加一条吧"
+		return "没有匹配的任务"
 	}
 	var sb strings.Builder
 	for _, t := range tasks {
@@ -217,12 +271,19 @@ func cmdList() string {
 		dueStr := ""
 		if t.DueDate != "" {
 			dueStr = "  截止:" + t.DueDate
+			if t.isOverdue() {
+				dueStr += "  ⚠逾期"
+			}
 		}
 		tagStr := ""
 		if len(t.Tags) > 0 {
 			tagStr = "  #" + strings.Join(t.Tags, " #")
 		}
-		fmt.Fprintf(&sb, "%s #%d [%s/%s] %s%s%s\n", mark, t.ID, priorityText(t.Priority), statusText(t.Status), t.Title, tagStr, dueStr)
+		noteStr := ""
+		if t.Note != "" {
+			noteStr = "  备注:" + t.Note
+		}
+		fmt.Fprintf(&sb, "%s #%d [%s/%s] %s%s%s%s\n", mark, t.ID, priorityText(t.Priority), statusText(t.Status), t.Title, tagStr, dueStr, noteStr)
 	}
 	return strings.TrimRight(sb.String(), "\n")
 }
@@ -303,8 +364,8 @@ func usage() {
 	fmt.Print(`go-todo 本地待办看板
 
 用法:
-  go-todo add <标题> [-tag a,b] [-pri high|mid|low] [-due 2026-08-10]   加一条任务
-  go-todo list                    列出全部（按优先级排序）
+  go-todo add <标题> [-tag a,b] [-pri high|mid|low] [-due 2026-08-10] [-note 备注]   加一条任务
+  go-todo list [-tag 工作] [-status todo|in_progress|done]   列出任务（可按标签/状态过滤）
   go-todo search <关键词>          按标题搜索
   go-todo start <编号>            标记为进行中
   go-todo done <编号>             标记为完成
@@ -341,7 +402,22 @@ func main() {
 		}
 		fmt.Println(out)
 	case "list":
-		fmt.Println(cmdList())
+		opt := listOptions{}
+		for i := 1; i < len(args); i++ {
+			switch args[i] {
+			case "-tag":
+				if i+1 < len(args) {
+					opt.tag = strings.TrimSpace(args[i+1])
+					i++
+				}
+			case "-status":
+				if i+1 < len(args) {
+					opt.status = strings.TrimSpace(args[i+1])
+					i++
+				}
+			}
+		}
+		fmt.Println(cmdList(opt))
 	case "search":
 		if len(args) < 2 {
 			fmt.Println("用法: go-todo search <关键词>")

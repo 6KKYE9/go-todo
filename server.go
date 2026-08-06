@@ -26,6 +26,7 @@ type taskJSON struct {
 	Priority  int      `json:"priority"`
 	Status    string   `json:"status"`
 	DueDate   string   `json:"due_date"`
+	Note      string   `json:"note"`
 	CreatedAt string   `json:"created_at"`
 }
 
@@ -43,6 +44,7 @@ func toJSON(tasks []Task) []taskJSON {
 			Priority:  t.Priority,
 			Status:    t.Status,
 			DueDate:   t.DueDate,
+			Note:      t.Note,
 			CreatedAt: t.CreatedAt,
 		})
 	}
@@ -78,6 +80,9 @@ func apiAdd(w http.ResponseWriter, r *http.Request) {
 	if due := strings.TrimSpace(r.FormValue("due")); due != "" {
 		args = append(args, "-due", due)
 	}
+	if note := strings.TrimSpace(r.FormValue("note")); note != "" {
+		args = append(args, "-note", note)
+	}
 	out, err := cmdAdd(args)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -88,7 +93,12 @@ func apiAdd(w http.ResponseWriter, r *http.Request) {
 }
 
 func apiList(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, toJSON(listTasks()))
+	q := r.URL.Query()
+	opt := listOptions{
+		tag:    strings.TrimSpace(q.Get("tag")),
+		status: strings.TrimSpace(q.Get("status")),
+	}
+	writeJSON(w, toJSON(filterTasks(listTasks(), opt)))
 }
 
 func apiSearch(w http.ResponseWriter, r *http.Request) {
@@ -229,6 +239,10 @@ const indexHTML = `<!DOCTYPE html>
         <label>标签（逗号分隔）</label>
         <input id="tags" placeholder="工作,会议">
       </div>
+      <div style="flex:2">
+        <label>备注</label>
+        <input id="note" placeholder="可选备注…">
+      </div>
     </div>
     <button onclick="addTask()">添加任务</button>
     <div id="status"></div>
@@ -236,6 +250,13 @@ const indexHTML = `<!DOCTYPE html>
 
   <div class="toolbar">
     <input id="q" placeholder="搜索关键词…" oninput="searchTasks()">
+    <input id="ftag" placeholder="按标签过滤 (如 工作)" oninput="loadTasks()">
+    <select id="fstatus" onchange="loadTasks()">
+      <option value="">全部状态</option>
+      <option value="todo">待办</option>
+      <option value="in_progress">进行中</option>
+      <option value="done">已完成</option>
+    </select>
     <button onclick="loadTasks()">显示全部</button>
   </div>
 
@@ -248,7 +269,14 @@ function status(msg, cls) {
 }
 function loadTasks() {
   document.getElementById('q').value = '';
-  fetch('/api/list').then(r => r.json()).then(render).catch(e => status('加载失败：' + e, 'err'));
+  const tag = document.getElementById('ftag').value.trim();
+  const status = document.getElementById('fstatus').value;
+  let url = '/api/list';
+  const params = [];
+  if (tag) params.push('tag=' + encodeURIComponent(tag));
+  if (status) params.push('status=' + encodeURIComponent(status));
+  if (params.length) url += '?' + params.join('&');
+  fetch(url).then(r => r.json()).then(render).catch(e => status('加载失败：' + e, 'err'));
 }
 function searchTasks() {
   const q = document.getElementById('q').value.trim();
@@ -260,9 +288,10 @@ function addTask() {
   const pri = document.getElementById('pri').value;
   const due = document.getElementById('due').value.trim();
   const tags = document.getElementById('tags').value.trim();
+  const note = document.getElementById('note').value.trim();
   if (!title) { status('标题不能为空', 'err'); return; }
   const fd = new URLSearchParams();
-  fd.append('title', title); fd.append('pri', pri); fd.append('due', due); fd.append('tags', tags);
+  fd.append('title', title); fd.append('pri', pri); fd.append('due', due); fd.append('tags', tags); fd.append('note', note);
   fetch('/api/add', {method:'POST', body: fd})
     .then(r => r.json().then(d => ({ok: r.ok, d})))
     .then(({ok, d}) => {
@@ -271,6 +300,7 @@ function addTask() {
       document.getElementById('title').value = '';
       document.getElementById('due').value = '';
       document.getElementById('tags').value = '';
+      document.getElementById('note').value = '';
       loadTasks();
     })
     .catch(e => status('添加失败：' + e, 'err'));
@@ -288,7 +318,9 @@ function render(tasks) {
   box.innerHTML = tasks.map(t => {
     const tags = (t.tags || []).map(x => '<span>#' + escapeHtml(x) + '</span>').join('');
     const cls = t.status === 'done' ? 'task done' : (t.status === 'in_progress' ? 'task in_progress' : 'task');
-    const dueStr = t.due_date ? ' · 截止 ' + escapeHtml(t.due_date) : '';
+    let dueStr = t.due_date ? ' · 截止 ' + escapeHtml(t.due_date) : '';
+    if (t.due_date && t.status !== 'done' && t.due_date < todayStr()) dueStr += ' · <span style="color:#e74c3c;font-weight:600">⚠逾期</span>';
+    const noteStr = t.note ? ' · 备注 ' + escapeHtml(t.note) : '';
     let ops = '';
     if (t.status !== 'done') ops += '<button onclick="act(\'/api/done\',' + t.id + ')">完成</button>';
     if (t.status !== 'in_progress' && t.status !== 'done') ops += '<button onclick="act(\'/api/start\',' + t.id + ')">进行中</button>';
@@ -297,9 +329,11 @@ function render(tasks) {
       '<div class="top"><div class="title">' + escapeHtml(t.title) + '</div>' +
       '<span class="pri pri-' + t.priority + '">' + (t.priority===3?'高':(t.priority===2?'中':'低')) + '</span></div>' +
       (tags ? '<div class="tags">' + tags + '</div>' : '') +
-      '<div class="meta">#' + t.id + ' · ' + statusText(t.status) + dueStr + ' · ' + t.created_at + '</div>' +
+      '<div class="meta">#' + t.id + ' · ' + statusText(t.status) + dueStr + noteStr + ' · ' + t.created_at + '</div>' +
       '<div class="ops">' + ops + '</div></div>';
   }).join('');
+}
+function todayStr() { return new Date().toISOString().slice(0,10); }
 }
 function statusText(s) { return s === 'done' ? '已完成' : (s === 'in_progress' ? '进行中' : '待办'); }
 function escapeHtml(s) {
