@@ -14,59 +14,79 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
-	"strconv"
 	"strings"
+	"time"
 )
 
-type taskJSON struct {
-	ID        int      `json:"id"`
-	Title     string   `json:"title"`
-	Tags      []string `json:"tags"`
-	Priority  int      `json:"priority"`
-	Status    string   `json:"status"`
-	DueDate   string   `json:"due_date"`
-	Note      string   `json:"note"`
-	CreatedAt string   `json:"created_at"`
-}
-
-func toJSON(tasks []Task) []taskJSON {
-	out := make([]taskJSON, 0, len(tasks))
+// toJSON 把内部 Task 转成给前端的形态。
+// 原来这里另外定义了一份字段完全相同的 taskJSON 结构体，
+// 两处 tag 一旦改歪就会静默不一致；直接复用 Task 即可，
+// 唯一需要处理的是 nil Tags —— 它会被编码成 null，
+// 前端 (t.tags || []) 虽然兜住了，但 API 消费者不该看到 null。
+func toJSON(tasks []Task) []Task {
+	out := make([]Task, 0, len(tasks))
 	for _, t := range tasks {
-		tags := t.Tags
-		if tags == nil {
-			tags = []string{}
+		if t.Tags == nil {
+			t.Tags = []string{}
 		}
-		out = append(out, taskJSON{
-			ID:        t.ID,
-			Title:     t.Title,
-			Tags:      tags,
-			Priority:  t.Priority,
-			Status:    t.Status,
-			DueDate:   t.DueDate,
-			Note:      t.Note,
-			CreatedAt: t.CreatedAt,
-		})
+		out = append(out, t)
 	}
 	return out
 }
 
-func writeJSON(w http.ResponseWriter, v interface{}) {
+func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	json.NewEncoder(w).Encode(v)
+	w.WriteHeader(code)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		// 响应头已发出，只能记日志，不能再改状态码。
+		log.Printf("写响应失败: %v", err)
+	}
+}
+
+func writeErr(w http.ResponseWriter, code int, msg string) {
+	writeJSON(w, code, map[string]string{"error": msg})
+}
+
+// requirePost 拦掉非 POST 的写操作，并带上 Allow 头（RFC 要求 405 必须给）。
+func requirePost(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeErr(w, http.StatusMethodNotAllowed, "仅支持 POST")
+		return false
+	}
+	return true
+}
+
+// requireGet 拦掉非 GET 的读操作。
+func requireGet(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeErr(w, http.StatusMethodNotAllowed, "仅支持 GET")
+		return false
+	}
+	return true
+}
+
+// readTasks 在锁内读一次任务，避免和写请求撞上读到半截数据。
+func readTasks() ([]Task, error) {
+	storeMu.Lock()
+	defer storeMu.Unlock()
+	return listTasks()
 }
 
 func apiAdd(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		writeJSON(w, map[string]string{"error": "仅支持 POST"})
+	if !requirePost(w, r) {
 		return
 	}
-	_ = r.ParseForm()
+	if err := r.ParseForm(); err != nil {
+		writeErr(w, http.StatusBadRequest, "表单解析失败: "+err.Error())
+		return
+	}
 	title := strings.TrimSpace(r.FormValue("title"))
 	if title == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		writeJSON(w, map[string]string{"error": "title 不能为空"})
+		writeErr(w, http.StatusBadRequest, "title 不能为空")
 		return
 	}
 	var args []string
@@ -85,29 +105,48 @@ func apiAdd(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := cmdAdd(args)
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		writeJSON(w, map[string]string{"error": err.Error()})
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, map[string]string{"ok": out})
+	writeJSON(w, http.StatusOK, map[string]string{"ok": out})
 }
 
 func apiList(w http.ResponseWriter, r *http.Request) {
+	if !requireGet(w, r) {
+		return
+	}
 	q := r.URL.Query()
 	opt := listOptions{
 		tag:    strings.TrimSpace(q.Get("tag")),
 		status: strings.TrimSpace(q.Get("status")),
 	}
-	writeJSON(w, toJSON(filterTasks(listTasks(), opt)))
+	// 状态过滤值同样做白名单，和 CLI 的 cmdList 保持一致。
+	if opt.status != "" && !validStatus(opt.status) {
+		writeErr(w, http.StatusBadRequest, "status 应为 todo|in_progress|done")
+		return
+	}
+	tasks, err := readTasks()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, toJSON(filterTasks(tasks, opt)))
 }
 
 func apiSearch(w http.ResponseWriter, r *http.Request) {
-	q := strings.TrimSpace(r.URL.Query().Get("q"))
-	if q == "" {
-		writeJSON(w, toJSON(listTasks()))
+	if !requireGet(w, r) {
 		return
 	}
-	tasks := load()
+	tasks, err := readTasks()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	if q == "" {
+		writeJSON(w, http.StatusOK, toJSON(tasks))
+		return
+	}
 	q = strings.ToLower(q)
 	var hit []Task
 	for _, t := range tasks {
@@ -115,29 +154,29 @@ func apiSearch(w http.ResponseWriter, r *http.Request) {
 			hit = append(hit, t)
 		}
 	}
-	writeJSON(w, toJSON(hit))
+	writeJSON(w, http.StatusOK, toJSON(hit))
 }
 
 func statusPost(w http.ResponseWriter, r *http.Request, action string, fn func(int) (string, error)) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		writeJSON(w, map[string]string{"error": "仅支持 POST"})
+	if !requirePost(w, r) {
 		return
 	}
-	_ = r.ParseForm()
-	id, err := strconv.Atoi(r.FormValue("id"))
+	if err := r.ParseForm(); err != nil {
+		writeErr(w, http.StatusBadRequest, "表单解析失败: "+err.Error())
+		return
+	}
+	// 复用 CLI 的 parseID，"12abc"/"-1" 在两端都会被同样拒绝。
+	id, err := parseID(r.FormValue("id"))
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		writeJSON(w, map[string]string{"error": "id 需要是数字"})
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	out, err := fn(id)
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		writeJSON(w, map[string]string{"error": err.Error()})
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, map[string]string{"ok": out, "action": action})
+	writeJSON(w, http.StatusOK, map[string]string{"ok": out, "action": action})
 }
 
 func apiDone(w http.ResponseWriter, r *http.Request) {
@@ -153,21 +192,47 @@ func apiRm(w http.ResponseWriter, r *http.Request) {
 }
 
 func indexPage(w http.ResponseWriter, r *http.Request) {
+	// "/" 在 ServeMux 里是兜底模式，任何未注册路径都会落到这里。
+	// 不判断的话访问 /favicon.ico 也会返回整页 HTML。
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	if !requireGet(w, r) {
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, indexHTML)
 }
 
+// newMux 组装路由。独立成函数，测试里可以直接拿到一个干净的 mux，
+// 不用碰全局的 http.DefaultServeMux（重复注册会 panic，多个测试就跑不起来）。
+func newMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", indexPage)
+	mux.HandleFunc("/api/add", apiAdd)
+	mux.HandleFunc("/api/list", apiList)
+	mux.HandleFunc("/api/search", apiSearch)
+	mux.HandleFunc("/api/done", apiDone)
+	mux.HandleFunc("/api/start", apiStart)
+	mux.HandleFunc("/api/rm", apiRm)
+	return mux
+}
+
 // StartServer 启动 Web 服务，监听 addr（如 ":8080"）。
 func StartServer(addr string) error {
-	http.HandleFunc("/", indexPage)
-	http.HandleFunc("/api/add", apiAdd)
-	http.HandleFunc("/api/list", apiList)
-	http.HandleFunc("/api/search", apiSearch)
-	http.HandleFunc("/api/done", apiDone)
-	http.HandleFunc("/api/start", apiStart)
-	http.HandleFunc("/api/rm", apiRm)
+	// 显式建 http.Server 而不是 ListenAndServe(addr, nil)：
+	// 后者没有任何超时，一个卡住的连接会永久占着 goroutine 和 fd。
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           newMux(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	fmt.Printf("go-todo 网页界面已启动： http://localhost%s\n", addr)
-	return http.ListenAndServe(addr, nil)
+	return srv.ListenAndServe()
 }
 
 const indexHTML = `<!DOCTYPE html>
@@ -329,12 +394,11 @@ function render(tasks) {
       '<div class="top"><div class="title">' + escapeHtml(t.title) + '</div>' +
       '<span class="pri pri-' + t.priority + '">' + (t.priority===3?'高':(t.priority===2?'中':'低')) + '</span></div>' +
       (tags ? '<div class="tags">' + tags + '</div>' : '') +
-      '<div class="meta">#' + t.id + ' · ' + statusText(t.status) + dueStr + noteStr + ' · ' + t.created_at + '</div>' +
+      '<div class="meta">#' + t.id + ' · ' + statusText(t.status) + dueStr + noteStr + ' · ' + escapeHtml(t.created_at) + '</div>' +
       '<div class="ops">' + ops + '</div></div>';
   }).join('');
 }
 function todayStr() { return new Date().toISOString().slice(0,10); }
-}
 function statusText(s) { return s === 'done' ? '已完成' : (s === 'in_progress' ? '进行中' : '待办'); }
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));

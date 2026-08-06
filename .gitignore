@@ -6,3 +6,8 @@
 *.dylib
 *.test
 *.out
+
+# 本地数据文件，别把自己的待办推到仓库里
+todo.json
+.todo-*.tmp
+
