@@ -22,10 +22,10 @@ type Task struct {
 	ID        int      `json:"id"`
 	Title     string   `json:"title"`
 	Tags      []string `json:"tags"`
-	Priority  int      `json:"priority"`  // 1=低 2=中 3=高
-	Status    string   `json:"status"`    // todo / in_progress / done
-	DueDate   string   `json:"due_date"`  // 截止日期，空表示无
-	Note      string   `json:"note"`      // 备注，空表示无
+	Priority  int      `json:"priority"` // 1=低 2=中 3=高
+	Status    string   `json:"status"`   // todo / in_progress / done
+	DueDate   string   `json:"due_date"` // 截止日期，空表示无
+	Note      string   `json:"note"`     // 备注，空表示无
 	CreatedAt string   `json:"created_at"`
 }
 
